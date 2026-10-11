@@ -428,38 +428,77 @@ pub async fn axfr(
     let mut response = SendRequestMulti::send_request(&*client, request);
     let mut interpreter = XfrResponseInterpreter::new();
 
-    // Process the first message.
-    let initial = response
+    // Process AXFR response messages.
+//
+// An AXFR response may span multiple DNS messages. The interpreter
+// is not guaranteed to produce a ZoneUpdate from every message.
+//
+// In particular, an initial message containing only an SOA record
+// may produce no updates.
+//
+// Continue reading until the interpreter emits DeleteAllRecords,
+// then process the remaining updates normally.
+
+let mut writer = None;
+
+let soa = loop {
+    // Retrieve the next AXFR response message.
+    let message = response
         .get_response()
         .await?
         .ok_or(AxfrError::IncompleteResponse)?;
 
     metrics
         .num_loaded_bytes
-        .fetch_add(initial.as_slice().len(), Relaxed);
-    let mut updates = interpreter.interpret_response(initial)?;
+        .fetch_add(message.as_slice().len(), Relaxed);
 
-    assert!(updates.next().unwrap()? == ZoneUpdate::DeleteAllRecords);
-    let mut writer = builder.replace().unwrap();
+    let mut updates = interpreter.interpret_response(message)?;
 
-    // Process the response messages.
-    let soa = loop {
-        if let Some(soa) = process_axfr(&mut writer, updates, metrics)? {
-            break soa;
-        } else {
-            // Retrieve the next message.
-            let message = response
-                .get_response()
-                .await?
-                .ok_or(AxfrError::IncompleteResponse)?;
-            metrics
-                .num_loaded_bytes
-                .fetch_add(message.as_slice().len(), Relaxed);
-            updates = interpreter.interpret_response(message)?;
+    // Initialize the zone replacement when the interpreter
+    // announces the beginning of a complete zone transfer.
+    if writer.is_none() {
+        match updates.next() {
+            Some(Ok(ZoneUpdate::DeleteAllRecords)) => {
+                writer = Some(
+                    builder
+                        .replace()
+                        .ok_or(AxfrError::IncompleteResponse)?
+                );
+            }
+
+            Some(Ok(_)) => {
+                // The interpreter produced an unexpected update
+                // before announcing a complete zone replacement.
+                return Err(AxfrError::IncompleteResponse);
+            }
+
+            Some(Err(err)) => {
+                return Err(err.into());
+            }
+
+            None => {
+                // No updates yet.
+                // The interpreter may need another DNS message.
+                continue;
+            }
         }
-    };
+    }
 
-    assert!(interpreter.is_finished());
+    // Process all remaining updates from this message.
+    let writer = writer
+        .as_mut()
+        .ok_or(AxfrError::IncompleteResponse)?;
+
+    if let Some(soa) = process_axfr(
+        writer,
+        updates,
+        metrics,
+    )? {
+        break soa;
+    }
+};
+
+let mut writer = writer.ok_or(AxfrError::IncompleteResponse)?;
     writer.add(soa.clone().into())?;
     writer.set_soa(soa)?;
     writer.apply()?;
